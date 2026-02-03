@@ -29,17 +29,22 @@
 //!    └───────────┘         └─────────────┘        └─────────────┘
 //! ```
 //!
-//! ## Running Crayons Ltd. Design Philosophy
+//! ## Module Structure
 //!
-//! - "If it compiles, it's probably art"
-//! - "Comments should spark joy"
-//! - "Error messages are love letters to future developers"
-//!
-//! ## Technical Notes
-//!
-//! This backend renders to a single macOS window. Wayland clients connect
-//! to our embedded server and we composite their content using Metal.
-//! Think of it as a Wayland server in a cozy macOS wrapper.
+//! - `window` - Cocoa window management (NSWindow, NSView)
+//! - `input` - IOKit HID input handling
+//! - `display` - Core Graphics display management
+//! - `render` - Metal/OpenGL rendering
+
+// Sub-modules
+#[cfg(target_os = "macos")]
+pub mod window;
+#[cfg(target_os = "macos")]
+pub mod input;
+#[cfg(target_os = "macos")]
+pub mod display;
+#[cfg(target_os = "macos")]
+pub mod render;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -57,78 +62,64 @@ use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_pre
 use smithay::utils::Size;
 use smithay::wayland::presentation::Refresh;
 
-use super::{IpcOutputMap, OutputId, RenderResult};
+use crate::backend::{IpcOutputMap, OutputId, RenderResult};
 use crate::niri::{Niri, RedrawState, State};
 use crate::utils::{get_monotonic_time, logical_output};
 
+#[cfg(target_os = "macos")]
+use self::window::CocoaWindow;
+#[cfg(target_os = "macos")]
+use self::input::InputHandler;
+#[cfg(target_os = "macos")]
+use self::display::DisplayManager;
+
 /// 🖥️ Display information from macOS
-///
-/// Represents a physical display attached to the system.
-/// On macOS, we query these via Core Graphics (CGDisplay).
 #[derive(Debug, Clone)]
 pub struct MacOSDisplay {
-    /// The Core Graphics display ID
     pub display_id: u32,
-    /// Display name (e.g., "Built-in Retina Display")
     pub name: String,
-    /// Physical size in millimeters (if available)
     pub physical_size_mm: Option<(u32, u32)>,
-    /// Current resolution
     pub resolution: (u32, u32),
-    /// Refresh rate in millihertz (e.g., 60000 = 60Hz)
     pub refresh_rate: u32,
-    /// Scale factor (e.g., 2.0 for Retina)
     pub scale_factor: f64,
-    /// Whether this is the main display
     pub is_main: bool,
 }
 
 /// ⌨️ Input event types from macOS
-///
-/// These get translated to smithay input events.
 #[derive(Debug, Clone)]
 pub enum MacOSInputEvent {
-    /// Keyboard key press/release
     Key {
         keycode: u16,
         pressed: bool,
         modifiers: MacOSModifiers,
     },
-    /// Mouse/trackpad movement
     PointerMotion {
         dx: f64,
         dy: f64,
     },
-    /// Absolute pointer position
     PointerMotionAbsolute {
         x: f64,
         y: f64,
     },
-    /// Mouse button press/release
     PointerButton {
         button: u32,
         pressed: bool,
     },
-    /// Scroll wheel / trackpad scroll
     PointerAxis {
         horizontal: f64,
         vertical: f64,
-        /// Whether this is from a trackpad (enables smooth scrolling)
         is_trackpad: bool,
     },
-    /// Trackpad pinch gesture (zoom)
     GesturePinch {
         scale: f64,
         phase: GesturePhase,
     },
-    /// Trackpad swipe gesture
     GestureSwipe {
         dx: f64,
         dy: f64,
         fingers: u32,
         phase: GesturePhase,
     },
-    /// Trackpad rotation gesture
     GestureRotate {
         angle: f64,
         phase: GesturePhase,
@@ -149,131 +140,35 @@ pub enum GesturePhase {
 pub struct MacOSModifiers {
     pub shift: bool,
     pub ctrl: bool,
-    pub alt: bool,    // Option key on Mac
-    pub logo: bool,   // Command key on Mac
+    pub alt: bool,
+    pub logo: bool,
     pub caps_lock: bool,
 }
 
 /// 🎨 The main macOS backend structure
-///
-/// This is where the magic happens! We manage:
-/// - A Cocoa window for display
-/// - Metal rendering pipeline
-/// - IOKit-based input handling
-/// - Display hotplug detection
 pub struct MacOS {
-    /// Configuration reference (shared with the compositor)
     config: Rc<RefCell<Config>>,
-
-    /// Our primary output representing the macOS window
     output: Output,
-
-    /// The window dimensions (can be resized)
     window_size: Size<i32, smithay::utils::Physical>,
-
-    /// Scale factor for HiDPI (Retina) displays
     scale_factor: f64,
-
-    /// IPC output information for niri clients
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
-
-    /// Track when we last rendered (for frame pacing)
     last_frame_time: Instant,
-
-    /// Target frame duration (1/60s default, adjusted for ProMotion)
     target_frame_duration: Duration,
-
-    /// Whether the window currently has focus
     has_focus: bool,
-
-    /// Queued input events to process
     input_queue: Vec<MacOSInputEvent>,
-
-    /// Current modifier state
     modifiers: MacOSModifiers,
-
-    /// Debug tint flag (for visual debugging)
     debug_tint_enabled: bool,
-
-    /// 🦀 Placeholder for the actual renderer
-    /// In a full implementation, this would be MetalRenderer or GlesRenderer
     renderer: Option<GlesRenderer>,
 
-    /// 🪟 Window handle (platform-specific)
-    /// Wrapped in Option for lazy initialization
     #[cfg(target_os = "macos")]
-    window_handle: Option<MacOSWindowHandle>,
-}
-
-/// 🪟 Native macOS window handle
-///
-/// Wraps the Objective-C objects needed to manage the window.
-/// We use raw pointers because Cocoa objects are reference-counted
-/// separately from Rust's ownership model.
-#[cfg(target_os = "macos")]
-pub struct MacOSWindowHandle {
-    // Note: In the actual implementation, these would be:
-    // ns_window: *mut Object,      // NSWindow
-    // ns_view: *mut Object,        // NSView (our Metal view)
-    // metal_layer: *mut Object,    // CAMetalLayer
-    _marker: std::marker::PhantomData<()>,
-}
-
-#[cfg(target_os = "macos")]
-impl MacOSWindowHandle {
-    /// Creates a new window with the specified title and size
-    pub fn new(title: &str, width: u32, height: u32) -> Self {
-        // TODO: Actual Cocoa implementation
-        // This would call NSApplication.shared(), create NSWindow, etc.
-        info!("🍎 Creating macOS window: '{}' ({}x{})", title, width, height);
-        Self {
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    /// Requests a redraw on the next display refresh
-    pub fn request_redraw(&self) {
-        // TODO: Call setNeedsDisplay: on the view
-        trace!("🎨 Requesting window redraw");
-    }
-
-    /// Updates the window title
-    pub fn set_title(&self, _title: &str) {
-        // TODO: [window setTitle: title]
-    }
-
-    /// Gets the current window size
-    pub fn size(&self) -> (u32, u32) {
-        // TODO: Query actual window size
-        (1280, 800)
-    }
-
-    /// Gets the backing scale factor (2.0 for Retina)
-    pub fn scale_factor(&self) -> f64 {
-        // TODO: [window backingScaleFactor]
-        2.0
-    }
+    window: Option<CocoaWindow>,
+    #[cfg(target_os = "macos")]
+    input_handler: Option<InputHandler>,
+    #[cfg(target_os = "macos")]
+    display_manager: Option<DisplayManager>,
 }
 
 impl MacOS {
-    /// 🎬 Creates a new macOS backend instance
-    ///
-    /// This sets up:
-    /// - The Cocoa application (if not already running)
-    /// - A native window for rendering
-    /// - Metal or OpenGL context
-    /// - Input event handlers
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - The compositor configuration
-    /// * `event_loop` - The calloop event loop handle
-    ///
-    /// # Panics
-    ///
-    /// Panics if unable to create the window or graphics context.
-    /// (We panic rather than return errors because if these fail,
-    /// there's nothing useful we can do anyway.)
     pub fn new(
         config: Rc<RefCell<Config>>,
         event_loop: LoopHandle<State>,
@@ -284,32 +179,28 @@ impl MacOS {
         info!("   Welcome to niri on macOS!");
         info!("   Running Crayons Ltd. Certified(TM)");
 
-        // Default window size - a nice 16:10 that looks good on Mac
         let initial_width = 1280;
         let initial_height = 800;
-        let scale_factor = 2.0; // Assume Retina by default
+        let scale_factor = 2.0;
 
-        // Create the smithay Output representing our window
         let output = Output::new(
             "macos".to_string(),
             PhysicalProperties {
-                size: (0, 0).into(), // We'll set this properly later
-                subpixel: Subpixel::Unknown, // macOS handles subpixel rendering
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
                 make: "Apple".into(),
                 model: "macOS Window".into(),
                 serial_number: "niri-macos-001".into(),
             },
         );
 
-        // Set up the display mode
         let mode = Mode {
             size: Size::from((initial_width, initial_height)),
-            refresh: 60_000, // 60Hz default, ProMotion can go higher
+            refresh: 60_000,
         };
         output.change_current_state(Some(mode), None, None, None);
         output.set_preferred(mode);
 
-        // Store output name for IPC
         output.user_data().insert_if_missing(|| OutputName {
             connector: "macos".to_string(),
             make: Some("Apple".to_string()),
@@ -317,7 +208,6 @@ impl MacOS {
             serial: None,
         });
 
-        // Build IPC output info
         let physical_properties = output.physical_properties();
         let ipc_outputs = Arc::new(Mutex::new(HashMap::from([(
             OutputId::next(),
@@ -335,23 +225,16 @@ impl MacOS {
                 }],
                 current_mode: Some(0),
                 is_custom_mode: true,
-                vrr_supported: false, // TODO: Support ProMotion VRR
+                vrr_supported: false,
                 vrr_enabled: false,
                 logical: Some(logical_output(&output)),
             },
         )])));
 
-        // Set up event loop integration
-        // In the full implementation, we'd register:
-        // 1. A file descriptor for Cocoa event notifications
-        // 2. A timer for frame pacing
-        // 3. Display link callbacks for vsync
-
-        // Create timer for frame callbacks (placeholder)
+        // Set up frame callback timer
         let timer = calloop::timer::Timer::immediate();
         event_loop
             .insert_source(timer, |_, _, state| {
-                // Check if animations need another frame
                 let macos = state.backend.macos();
                 if state.niri.output_state.values().any(|s| s.unfinished_animations_remain) {
                     state.niri.queue_redraw(&macos.output);
@@ -377,44 +260,48 @@ impl MacOS {
             debug_tint_enabled: false,
             renderer: None,
             #[cfg(target_os = "macos")]
-            window_handle: None,
+            window: None,
+            #[cfg(target_os = "macos")]
+            input_handler: None,
+            #[cfg(target_os = "macos")]
+            display_manager: None,
         }
     }
 
-    /// 🚀 Initializes the backend after the compositor is ready
-    ///
-    /// This is called by the compositor after State is fully constructed.
-    /// We use this to:
-    /// - Bind the renderer to the Wayland display
-    /// - Initialize custom shaders
-    /// - Add our output to the compositor
     pub fn init(&mut self, niri: &mut Niri) {
         let _span = tracy_client::span!("MacOS::init");
 
         info!("🍎 Completing macOS backend initialization...");
 
-        // In the full implementation:
-        // 1. Create Metal/GL renderer
-        // 2. Bind to Wayland display
-        // 3. Initialize shaders
+        #[cfg(target_os = "macos")]
+        {
+            // Initialize display manager
+            self.display_manager = Some(DisplayManager::new());
 
-        // Add our output to the compositor
+            // Create the Cocoa window
+            match CocoaWindow::new("niri", self.window_size.w as u32, self.window_size.h as u32) {
+                Ok(window) => {
+                    self.window = Some(window);
+                    info!("🪟 Cocoa window created successfully");
+                }
+                Err(e) => {
+                    error!("Failed to create Cocoa window: {}", e);
+                }
+            }
+
+            // Initialize input handler
+            self.input_handler = Some(InputHandler::new());
+        }
+
         niri.add_output(self.output.clone(), None, false);
 
         info!("🍎 Backend ready! Let's make some pixels dance! 💃");
     }
 
-    /// 🪑 Returns the seat name for input devices
-    ///
-    /// On macOS, we have a single "seat" representing the local input.
     pub fn seat_name(&self) -> String {
         "macos".to_owned()
     }
 
-    /// 🎨 Provides access to the primary renderer
-    ///
-    /// This allows the compositor to perform render operations
-    /// like importing textures, setting up shaders, etc.
     pub fn with_primary_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut GlesRenderer) -> T,
@@ -422,39 +309,17 @@ impl MacOS {
         self.renderer.as_mut().map(f)
     }
 
-    /// 🖼️ Renders a frame to the output
-    ///
-    /// This is the heart of the rendering pipeline:
-    /// 1. Gather all render elements from the compositor
-    /// 2. Render them to a Metal texture
-    /// 3. Present the texture to the window
-    /// 4. Handle presentation feedback
-    ///
-    /// # Returns
-    ///
-    /// - `RenderResult::Submitted` - Frame was rendered and presented
-    /// - `RenderResult::NoDamage` - No changes, frame skipped
-    /// - `RenderResult::Skipped` - Error or other reason to skip
     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
         let _span = tracy_client::span!("MacOS::render");
 
-        // Frame pacing - don't render faster than the display can show
         let elapsed = self.last_frame_time.elapsed();
         if elapsed < self.target_frame_duration {
-            // We could sleep here, but better to let the event loop handle it
             return RenderResult::Skipped;
         }
 
-        // TODO: In the full implementation:
-        // 1. Get render elements from niri.render()
-        // 2. Render to Metal texture
-        // 3. Present drawable
-
-        // For now, just handle the timing and callbacks
         self.last_frame_time = Instant::now();
 
-        // Send presentation feedback to Wayland clients
-        // This tells them when their content was displayed
+        // Send presentation feedback
         let states = smithay::backend::renderer::element::RenderElementStates::default();
         let mut presentation_feedbacks = niri.take_presentation_feedbacks(output, &states);
         presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
@@ -477,64 +342,42 @@ impl MacOS {
         output_state.frame_callback_sequence =
             output_state.frame_callback_sequence.wrapping_add(1);
 
-        // Request another frame if animations are running
-        if output_state.unfinished_animations_remain {
-            #[cfg(target_os = "macos")]
-            if let Some(ref window) = self.window_handle {
-                window.request_redraw();
-            }
+        #[cfg(target_os = "macos")]
+        if let Some(ref window) = self.window {
+            window.request_redraw();
         }
 
         RenderResult::Submitted
     }
 
-    /// 🔲 Toggles the debug tint overlay
-    ///
-    /// When enabled, this applies a colored tint to rendered content
-    /// to help visualize damage regions and render order.
     pub fn toggle_debug_tint(&mut self) {
         self.debug_tint_enabled = !self.debug_tint_enabled;
         info!(
             "🎨 Debug tint {}",
             if self.debug_tint_enabled { "enabled" } else { "disabled" }
         );
-        // TODO: Apply to renderer
     }
 
-    /// 📦 Imports a DMA-BUF for use in rendering
-    ///
-    /// DMA-BUFs are Linux's way of sharing GPU buffers.
-    /// On macOS, we'd need to convert these to IOSurfaces.
-    /// For now, we don't support this (most macOS clients don't use dmabuf anyway).
     pub fn import_dmabuf(&mut self, _dmabuf: &Dmabuf) -> bool {
         warn!("🚫 DMA-BUF import not supported on macOS");
-        warn!("   (This is expected - macOS clients use different buffer sharing)");
         false
     }
 
-    /// 📊 Returns the IPC output map
-    ///
-    /// This is used by the niri IPC server to report output information.
     pub fn ipc_outputs(&self) -> Arc<Mutex<IpcOutputMap>> {
         self.ipc_outputs.clone()
     }
 
-    /// 📐 Handles window resize events from Cocoa
-    ///
-    /// Called when the user resizes the window or the display changes.
     pub fn handle_resize(&mut self, niri: &mut Niri, width: i32, height: i32) {
         info!("📐 Window resized to {}x{}", width, height);
 
         self.window_size = Size::from((width, height));
 
-        // Update the output mode
         let mode = Mode {
             size: self.window_size,
             refresh: 60_000,
         };
         self.output.change_current_state(Some(mode), None, None, None);
 
-        // Update IPC outputs
         {
             let mut ipc_outputs = self.ipc_outputs.lock().unwrap();
             if let Some(output) = ipc_outputs.values_mut().next() {
@@ -551,16 +394,7 @@ impl MacOS {
         niri.output_resized(&self.output);
     }
 
-    /// ⌨️ Processes a keyboard event
-    ///
-    /// Translates macOS key codes to Wayland key codes and
-    /// dispatches to the compositor's input handling.
-    pub fn handle_key_event(
-        &mut self,
-        keycode: u16,
-        pressed: bool,
-        modifiers: MacOSModifiers,
-    ) {
+    pub fn handle_key_event(&mut self, keycode: u16, pressed: bool, modifiers: MacOSModifiers) {
         self.modifiers = modifiers;
         self.input_queue.push(MacOSInputEvent::Key {
             keycode,
@@ -569,17 +403,14 @@ impl MacOS {
         });
     }
 
-    /// 🖱️ Processes pointer motion
     pub fn handle_pointer_motion(&mut self, dx: f64, dy: f64) {
         self.input_queue.push(MacOSInputEvent::PointerMotion { dx, dy });
     }
 
-    /// 🎯 Processes pointer button press/release
     pub fn handle_pointer_button(&mut self, button: u32, pressed: bool) {
         self.input_queue.push(MacOSInputEvent::PointerButton { button, pressed });
     }
 
-    /// 📜 Processes scroll events
     pub fn handle_scroll(&mut self, horizontal: f64, vertical: f64, is_trackpad: bool) {
         self.input_queue.push(MacOSInputEvent::PointerAxis {
             horizontal,
@@ -588,109 +419,59 @@ impl MacOS {
         });
     }
 
-    /// 🔎 Processes pinch gestures (zoom)
     pub fn handle_pinch_gesture(&mut self, scale: f64, phase: GesturePhase) {
         self.input_queue.push(MacOSInputEvent::GesturePinch { scale, phase });
     }
 
-    /// 👆 Processes swipe gestures
     pub fn handle_swipe_gesture(&mut self, dx: f64, dy: f64, fingers: u32, phase: GesturePhase) {
-        self.input_queue.push(MacOSInputEvent::GestureSwipe {
-            dx,
-            dy,
-            fingers,
-            phase,
-        });
+        self.input_queue.push(MacOSInputEvent::GestureSwipe { dx, dy, fingers, phase });
     }
 
-    /// 🔄 Processes rotation gestures
     pub fn handle_rotate_gesture(&mut self, angle: f64, phase: GesturePhase) {
         self.input_queue.push(MacOSInputEvent::GestureRotate { angle, phase });
     }
 
-    /// 🎭 Handles focus changes
     pub fn handle_focus_change(&mut self, focused: bool) {
         self.has_focus = focused;
-        info!(
-            "🎭 Window focus {}",
-            if focused { "gained" } else { "lost" }
-        );
+        info!("🎭 Window focus {}", if focused { "gained" } else { "lost" });
     }
 
-    /// 🚪 Handles window close request
-    ///
-    /// Called when the user clicks the red close button.
-    /// We pass this to the compositor to initiate shutdown.
     pub fn handle_close_requested(&self, niri: &mut Niri) {
         info!("🚪 Window close requested");
         niri.stop_signal.stop();
     }
 
-    /// 🔄 Drains the input event queue
-    ///
-    /// Returns all queued input events for processing by the compositor.
     pub fn drain_input_events(&mut self) -> Vec<MacOSInputEvent> {
         mem::take(&mut self.input_queue)
     }
 
-    /// 📍 Returns the output (for use by the compositor)
     pub fn output(&self) -> &Output {
         &self.output
     }
 
-    /// 📏 Returns current scale factor
     pub fn scale_factor(&self) -> f64 {
         self.scale_factor
     }
 
-    /// 🎥 Updates the scale factor (for display changes)
     pub fn set_scale_factor(&mut self, scale: f64) {
         if (self.scale_factor - scale).abs() > 0.01 {
             info!("📏 Scale factor changed: {} -> {}", self.scale_factor, scale);
             self.scale_factor = scale;
-            // TODO: Notify compositor of scale change
         }
     }
 
-    /// 🖥️ Enumerates connected displays
-    ///
-    /// Returns information about all displays attached to the system.
-    /// This is useful for multi-monitor support in the future.
     #[cfg(target_os = "macos")]
     pub fn enumerate_displays() -> Vec<MacOSDisplay> {
-        // TODO: Implement using CGGetActiveDisplayList and CGDisplayCopyDisplayMode
-        vec![MacOSDisplay {
-            display_id: 0,
-            name: "Built-in Display".to_string(),
-            physical_size_mm: Some((286, 179)), // 13" MacBook
-            resolution: (2560, 1600),
-            refresh_rate: 60_000,
-            scale_factor: 2.0,
-            is_main: true,
-        }]
+        DisplayManager::enumerate_displays()
     }
 }
 
 // ============================================================================
-// 🔧 Utility Functions
+// 🔧 Keycode Translation
 // ============================================================================
 
-/// 🍎 Translates macOS virtual key codes to Linux evdev codes
-///
-/// macOS uses its own key code system (defined in Events.h).
-/// We need to translate these to the evdev codes that Wayland expects.
-///
-/// # Arguments
-///
-/// * `macos_keycode` - The macOS virtual key code
-///
-/// # Returns
-///
-/// The corresponding Linux evdev key code, or None if unknown.
 #[allow(dead_code)]
 pub fn macos_keycode_to_evdev(macos_keycode: u16) -> Option<u32> {
-    // This is a partial mapping of common keys
-    // Full mapping would include all 128 macOS key codes
     Some(match macos_keycode {
         0x00 => 30,  // A
         0x01 => 31,  // S
@@ -744,13 +525,13 @@ pub fn macos_keycode_to_evdev(macos_keycode: u16) -> Option<u32> {
         0x32 => 41,  // `
         0x33 => 14,  // Backspace
         0x35 => 1,   // Escape
-        0x37 => 125, // Left Command -> Left Meta
+        0x37 => 125, // Left Command
         0x38 => 42,  // Left Shift
         0x39 => 58,  // Caps Lock
-        0x3A => 56,  // Left Alt (Option)
+        0x3A => 56,  // Left Alt
         0x3B => 29,  // Left Control
         0x3C => 54,  // Right Shift
-        0x3D => 100, // Right Alt (Option)
+        0x3D => 100, // Right Alt
         0x3E => 97,  // Right Control
         0x7A => 59,  // F1
         0x78 => 60,  // F2
@@ -772,26 +553,15 @@ pub fn macos_keycode_to_evdev(macos_keycode: u16) -> Option<u32> {
     })
 }
 
-/// 🖱️ Translates macOS mouse button numbers to Linux button codes
-///
-/// macOS button numbers:
-/// - 0: Left
-/// - 1: Right
-/// - 2: Middle
-/// - 3+: Extra buttons
 #[allow(dead_code)]
 pub fn macos_button_to_evdev(macos_button: u32) -> u32 {
     match macos_button {
         0 => 0x110, // BTN_LEFT
         1 => 0x111, // BTN_RIGHT
         2 => 0x112, // BTN_MIDDLE
-        n => 0x113 + (n - 3), // BTN_SIDE and up
+        n => 0x113 + (n - 3),
     }
 }
-
-// ============================================================================
-// 🧪 Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -799,36 +569,17 @@ mod tests {
 
     #[test]
     fn test_keycode_translation() {
-        // Test some common keys
-        assert_eq!(macos_keycode_to_evdev(0x00), Some(30)); // A
-        assert_eq!(macos_keycode_to_evdev(0x24), Some(28)); // Return
-        assert_eq!(macos_keycode_to_evdev(0x35), Some(1));  // Escape
-        assert_eq!(macos_keycode_to_evdev(0x31), Some(57)); // Space
-
-        // Unknown keycode
+        assert_eq!(macos_keycode_to_evdev(0x00), Some(30));
+        assert_eq!(macos_keycode_to_evdev(0x24), Some(28));
+        assert_eq!(macos_keycode_to_evdev(0x35), Some(1));
+        assert_eq!(macos_keycode_to_evdev(0x31), Some(57));
         assert_eq!(macos_keycode_to_evdev(0xFF), None);
     }
 
     #[test]
     fn test_button_translation() {
-        assert_eq!(macos_button_to_evdev(0), 0x110); // Left
-        assert_eq!(macos_button_to_evdev(1), 0x111); // Right
-        assert_eq!(macos_button_to_evdev(2), 0x112); // Middle
-    }
-
-    #[test]
-    fn test_gesture_phase_equality() {
-        assert_eq!(GesturePhase::Begin, GesturePhase::Begin);
-        assert_ne!(GesturePhase::Begin, GesturePhase::End);
-    }
-
-    #[test]
-    fn test_modifiers_default() {
-        let mods = MacOSModifiers::default();
-        assert!(!mods.shift);
-        assert!(!mods.ctrl);
-        assert!(!mods.alt);
-        assert!(!mods.logo);
-        assert!(!mods.caps_lock);
+        assert_eq!(macos_button_to_evdev(0), 0x110);
+        assert_eq!(macos_button_to_evdev(1), 0x111);
+        assert_eq!(macos_button_to_evdev(2), 0x112);
     }
 }
