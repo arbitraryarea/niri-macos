@@ -48,6 +48,8 @@ pub mod display;
 pub mod render;
 #[cfg(target_os = "macos")]
 pub mod event_loop;
+#[cfg(target_os = "macos")]
+pub mod input_adapter;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -534,6 +536,32 @@ impl MacOS {
 
     pub fn drain_input_events(&mut self) -> Vec<MacOSInputEvent> {
         mem::take(&mut self.input_queue)
+    }
+
+    /// Processes all queued input events and returns converted events.
+    #[cfg(target_os = "macos")]
+    pub fn process_input_events(&mut self) -> Vec<input_adapter::ConvertedEvent> {
+        use crate::utils::get_monotonic_time;
+
+        let raw_events = self.drain_input_events();
+        let time = get_monotonic_time();
+
+        raw_events
+            .into_iter()
+            .filter_map(|event| input_adapter::convert_input_event(event, time))
+            .collect()
+    }
+
+    /// Gets input events from the input handler (if any).
+    #[cfg(target_os = "macos")]
+    pub fn poll_input(&mut self) {
+        if let Some(ref handler) = self.input_handler {
+            // Drain events from the input handler and queue them
+            let events = handler.drain_events();
+            for event in events {
+                self.input_queue.push(event);
+            }
+        }
     }
 
     pub fn output(&self) -> &Output {
