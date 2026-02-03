@@ -35,6 +35,7 @@
 //! - `input` - IOKit HID input handling
 //! - `display` - Core Graphics display management
 //! - `render` - Metal/OpenGL rendering
+//! - `event_loop` - calloop integration for macOS events
 
 // Sub-modules
 #[cfg(target_os = "macos")]
@@ -45,6 +46,8 @@ pub mod input;
 pub mod display;
 #[cfg(target_os = "macos")]
 pub mod render;
+#[cfg(target_os = "macos")]
+pub mod event_loop;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -72,6 +75,10 @@ use self::window::CocoaWindow;
 use self::input::InputHandler;
 #[cfg(target_os = "macos")]
 use self::display::DisplayManager;
+#[cfg(target_os = "macos")]
+use self::event_loop::{MacOSEventSource, FrameTimer};
+#[cfg(target_os = "macos")]
+use self::render::MetalRenderer;
 
 /// 🖥️ Display information from macOS
 #[derive(Debug, Clone)]
@@ -166,6 +173,12 @@ pub struct MacOS {
     input_handler: Option<InputHandler>,
     #[cfg(target_os = "macos")]
     display_manager: Option<DisplayManager>,
+    #[cfg(target_os = "macos")]
+    event_source: Option<MacOSEventSource>,
+    #[cfg(target_os = "macos")]
+    frame_timer: FrameTimer,
+    #[cfg(target_os = "macos")]
+    metal_renderer: Option<MetalRenderer>,
 }
 
 impl MacOS {
@@ -246,6 +259,33 @@ impl MacOS {
         info!("🍎 macOS backend initialized successfully!");
         info!("   Window: {}x{} @ {}x scale", initial_width, initial_height, scale_factor);
 
+        // Set up event source for calloop integration
+        #[cfg(target_os = "macos")]
+        let event_source = match MacOSEventSource::new() {
+            Ok(source) => {
+                info!("🔄 macOS event source created");
+                Some(source)
+            }
+            Err(e) => {
+                error!("Failed to create event source: {}", e);
+                None
+            }
+        };
+
+        #[cfg(target_os = "macos")]
+        if let Some(ref source) = event_source {
+            // Register the event source with the calloop
+            let queue = source.event_queue();
+            if let Err(e) = event_loop.insert_source(
+                calloop::channel::channel::<()>().1, // Placeholder
+                move |_, _, _state| {
+                    // Events will be processed via the main input queue
+                },
+            ) {
+                warn!("Failed to register event source: {:?}", e);
+            }
+        }
+
         Self {
             config,
             output,
@@ -265,6 +305,12 @@ impl MacOS {
             input_handler: None,
             #[cfg(target_os = "macos")]
             display_manager: None,
+            #[cfg(target_os = "macos")]
+            event_source,
+            #[cfg(target_os = "macos")]
+            frame_timer: FrameTimer::new(60),
+            #[cfg(target_os = "macos")]
+            metal_renderer: None,
         }
     }
 
@@ -278,6 +324,18 @@ impl MacOS {
             // Initialize display manager
             self.display_manager = Some(DisplayManager::new());
 
+            // Detect ProMotion displays and update frame timer
+            if let Some(ref dm) = self.display_manager {
+                if let Some(main_display) = dm.get_main_display() {
+                    if dm.supports_promotion(main_display.id) {
+                        let max_fps = dm.max_refresh_rate(main_display.id) / 1000;
+                        self.frame_timer.set_target_fps(max_fps);
+                        self.target_frame_duration = Duration::from_secs_f64(1.0 / max_fps as f64);
+                        info!("🖥️ ProMotion detected, targeting {}Hz", max_fps);
+                    }
+                }
+            }
+
             // Create the Cocoa window
             match CocoaWindow::new("niri", self.window_size.w as u32, self.window_size.h as u32) {
                 Ok(window) => {
@@ -289,8 +347,22 @@ impl MacOS {
                 }
             }
 
+            // Initialize Metal renderer
+            match MetalRenderer::new() {
+                Ok(renderer) => {
+                    self.metal_renderer = Some(renderer);
+                    info!("🎨 Metal renderer initialized");
+                }
+                Err(e) => {
+                    error!("Failed to initialize Metal renderer: {}", e);
+                    info!("📝 Will fall back to software rendering");
+                }
+            }
+
             // Initialize input handler
-            self.input_handler = Some(InputHandler::new());
+            let mut input_handler = InputHandler::new();
+            input_handler.start();
+            self.input_handler = Some(input_handler);
         }
 
         niri.add_output(self.output.clone(), None, false);
@@ -312,12 +384,24 @@ impl MacOS {
     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
         let _span = tracy_client::span!("MacOS::render");
 
-        let elapsed = self.last_frame_time.elapsed();
-        if elapsed < self.target_frame_duration {
+        // Frame pacing using the frame timer
+        #[cfg(target_os = "macos")]
+        if !self.frame_timer.should_render() {
             return RenderResult::Skipped;
         }
 
+        #[cfg(not(target_os = "macos"))]
+        {
+            let elapsed = self.last_frame_time.elapsed();
+            if elapsed < self.target_frame_duration {
+                return RenderResult::Skipped;
+            }
+        }
+
         self.last_frame_time = Instant::now();
+
+        #[cfg(target_os = "macos")]
+        self.frame_timer.frame_rendered();
 
         // Send presentation feedback
         let states = smithay::backend::renderer::element::RenderElementStates::default();
@@ -342,9 +426,16 @@ impl MacOS {
         output_state.frame_callback_sequence =
             output_state.frame_callback_sequence.wrapping_add(1);
 
+        // Request window redraw for actual rendering
         #[cfg(target_os = "macos")]
         if let Some(ref window) = self.window {
             window.request_redraw();
+
+            // If we have animations running, schedule next frame
+            if output_state.unfinished_animations_remain {
+                let next_frame_ns = self.frame_timer.time_until_next_frame();
+                trace!("Scheduling next frame in {}ns", next_frame_ns);
+            }
         }
 
         RenderResult::Submitted
