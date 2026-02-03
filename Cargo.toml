@@ -67,15 +67,19 @@ clap = { workspace = true, features = ["string"] }
 clap_complete = "4.5.65"
 clap_complete_nushell = "4.5.10"
 directories = "6.0.0"
-drm-ffi = "0.9.0"
 fastrand = "2.3.0"
 futures-util = { version = "0.3.31", default-features = false, features = ["std", "io"] }
 git-version = "0.3.9"
 glam = "0.30.10"
-input = { version = "0.9.1", features = ["libinput_1_21"] }
 keyframe = { version = "1.1.1", default-features = false }
-libc = "0.2.180"
+
+# 🐧 libinput wrapper - Linux only (macOS has its own input party)
+[target.'cfg(target_os = "linux")'.dependencies]
+input = { version = "0.9.1", features = ["libinput_1_21"] }
+smithay-drm-extras = { git = "https://github.com/Smithay/smithay.git" }
 libdisplay-info = "0.3.0"
+drm-ffi = "0.9.0"
+libc = "0.2.180"
 log = { version = "0.4.29", features = ["max_level_trace", "release_max_level_debug"] }
 niri-config = { version = "25.11.0", path = "niri-config" }
 niri-ipc = { version = "25.11.0", path = "niri-ipc", features = ["clap"] }
@@ -88,7 +92,6 @@ profiling = "1.0.17"
 sd-notify = "0.4.5"
 serde.workspace = true
 serde_json.workspace = true
-smithay-drm-extras.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
 tracy-client.workspace = true
@@ -97,7 +100,32 @@ wayland-scanner = "0.31.8"
 xcursor = "0.3.10"
 zbus = { version = "5.13.0", optional = true }
 
+# 🍎 macOS-specific dependencies - Welcome to the walled garden!
+# These crates help us talk to Apple's frameworks without learning Objective-C
+# (because life is too short for square brackets)
+cocoa = { version = "0.26", optional = true }
+core-foundation = { version = "0.10", optional = true }
+core-graphics = { version = "0.24", optional = true }
+objc = { version = "0.2", optional = true }
+metal = { version = "0.30", optional = true }
+block = { version = "0.1", optional = true }
+foreign-types = { version = "0.5", optional = true }
+
+# Smithay: The swiss army knife of Wayland compositors
+# On Linux: Full-fat DRM/GBM/libinput goodness
+# On macOS: Slimmed down but still packing heat
 [dependencies.smithay]
+workspace = true
+features = [
+    "desktop",
+    "renderer_gl",
+    "renderer_pixman",
+    "renderer_multi",
+    "wayland_frontend",
+]
+
+# 🐧 Linux-exclusive smithay features - DRM, libinput, the whole enchilada
+[target.'cfg(target_os = "linux")'.dependencies.smithay]
 workspace = true
 features = [
     "backend_drm",
@@ -107,12 +135,7 @@ features = [
     "backend_session_libseat",
     "backend_udev",
     "backend_winit",
-    "desktop",
-    "renderer_gl",
-    "renderer_pixman",
-    "renderer_multi",
     "use_system_lib",
-    "wayland_frontend",
 ]
 
 [dev-dependencies]
@@ -144,6 +167,18 @@ profile-with-tracy-ondemand = ["profile-with-tracy", "tracy-client/ondemand", "t
 profile-with-tracy-allocations = ["profile-with-tracy"]
 # Enables dinit integration (global environment).
 dinit = []
+# 🍎 macOS native backend - the forbidden fruit of compositor dreams!
+# Uses Cocoa/AppKit for windowing, Metal for rendering, IOKit for input.
+# Warning: May cause your Linux friends to feel jealous.
+macos-native = [
+    "dep:cocoa",
+    "dep:core-foundation",
+    "dep:core-graphics",
+    "dep:objc",
+    "dep:metal",
+    "dep:block",
+    "dep:foreign-types",
+]
 
 [lints.clippy]
 new_without_default = "allow"

@@ -24,7 +24,9 @@ use niri::utils::spawning::{
     spawn, spawn_sh, store_and_increase_nofile_rlimit, CHILD_DISPLAY, CHILD_ENV,
     REMOVE_ENV_RUST_BACKTRACE, REMOVE_ENV_RUST_LIB_BACKTRACE,
 };
-use niri::utils::{cause_panic, version, watcher, xwayland, IS_SYSTEMD_SERVICE};
+use niri::utils::{cause_panic, version, watcher, IS_SYSTEMD_SERVICE};
+#[cfg(target_os = "linux")]
+use niri::utils::xwayland;
 use niri_config::{Config, ConfigPath};
 use niri_ipc::socket::SOCKET_PATH_ENV;
 use sd_notify::NotifyState;
@@ -195,15 +197,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("IPC listening on: {}", socket_path.to_string_lossy());
     }
 
-    // Setup xwayland-satellite integration.
-    xwayland::satellite::setup(&mut state);
-    if let Some(satellite) = &state.niri.satellite {
-        let name = satellite.display_name();
-        *CHILD_DISPLAY.write().unwrap() = Some(name.to_owned());
-        env::set_var("DISPLAY", name);
-        info!("listening on X11 socket: {name}");
-    } else {
-        // Avoid spawning children in the host X11.
+    // 🐧 Setup xwayland-satellite integration (Linux only)
+    #[cfg(target_os = "linux")]
+    {
+        xwayland::satellite::setup(&mut state);
+        if let Some(satellite) = &state.niri.satellite {
+            let name = satellite.display_name();
+            *CHILD_DISPLAY.write().unwrap() = Some(name.to_owned());
+            env::set_var("DISPLAY", name);
+            info!("listening on X11 socket: {name}");
+        } else {
+            // Avoid spawning children in the host X11.
+            env::remove_var("DISPLAY");
+        }
+    }
+
+    // 🍎 On macOS, we don't have Xwayland
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Remove DISPLAY to avoid confusing apps
         env::remove_var("DISPLAY");
     }
 

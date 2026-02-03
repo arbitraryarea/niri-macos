@@ -41,6 +41,9 @@ pub mod spawning;
 pub mod transaction;
 pub mod vblank_throttle;
 pub mod watcher;
+
+// 🐧 Xwayland is Linux-only (requires X11 sockets, libinput, etc.)
+#[cfg(target_os = "linux")]
 pub mod xwayland;
 
 pub static IS_SYSTEMD_SERVICE: AtomicBool = AtomicBool::new(false);

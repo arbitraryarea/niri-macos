@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use calloop::timer::{TimeoutAction, Timer};
+// 🐧 libinput gesture coordinates (Linux only)
+#[cfg(target_os = "linux")]
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
     Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger, Xkb,
@@ -18,6 +20,8 @@ use smithay::backend::input::{
     TabletToolButtonEvent, TabletToolEvent, TabletToolProximityEvent, TabletToolTipEvent,
     TabletToolTipState, TouchEvent,
 };
+// 🐧 LibinputInputBackend (Linux only)
+#[cfg(target_os = "linux")]
 use smithay::backend::libinput::LibinputInputBackend;
 use smithay::input::dnd::DnDGrab;
 use smithay::input::keyboard::{keysyms, FilterResult, Keysym, Layout, ModifiersState};
@@ -194,6 +198,8 @@ impl State {
         }
     }
 
+    /// 🐧 Process libinput-specific events (Linux only)
+    #[cfg(target_os = "linux")]
     pub fn process_libinput_event(&mut self, event: &mut InputEvent<LibinputInputBackend>) {
         let _span = tracy_client::span!("process_libinput_event");
 
@@ -324,21 +330,25 @@ impl State {
             pos.x /= target_geo.size.w as f64;
             pos.y /= target_geo.size.h as f64;
 
-            let device = event.device();
-            if let Some(device) = (&device as &dyn Any).downcast_ref::<input::Device>() {
-                if let Some(data) = self.niri.tablets.get(device) {
-                    // This code does the same thing as mutter with "keep aspect ratio" enabled.
-                    let size = transform.invert().transform_size(target_geo.size);
-                    let output_aspect_ratio = size.w as f64 / size.h as f64;
-                    let ratio = data.aspect_ratio / output_aspect_ratio;
+            // 🐧 Tablet aspect ratio handling (Linux libinput only)
+            #[cfg(target_os = "linux")]
+            {
+                let device = event.device();
+                if let Some(device) = (&device as &dyn Any).downcast_ref::<input::Device>() {
+                    if let Some(data) = self.niri.tablets.get(device) {
+                        // This code does the same thing as mutter with "keep aspect ratio" enabled.
+                        let size = transform.invert().transform_size(target_geo.size);
+                        let output_aspect_ratio = size.w as f64 / size.h as f64;
+                        let ratio = data.aspect_ratio / output_aspect_ratio;
 
-                    if ratio > 1. {
-                        pos.x *= ratio;
-                    } else {
-                        pos.y /= ratio;
+                        if ratio > 1. {
+                            pos.x *= ratio;
+                        } else {
+                            pos.y /= ratio;
+                        }
                     }
                 }
-            };
+            }
 
             pos.x *= target_geo.size.w as f64;
             pos.y *= target_geo.size.h as f64;
@@ -3808,6 +3818,8 @@ impl State {
         let mut delta_x = event.delta_x();
         let mut delta_y = event.delta_y();
 
+        // 🐧 Use unaccelerated deltas from libinput if available (Linux only)
+        #[cfg(target_os = "linux")]
         if let Some(libinput_event) =
             (&event as &dyn Any).downcast_ref::<input::event::gesture::GestureSwipeUpdateEvent>()
         {
@@ -3817,11 +3829,15 @@ impl State {
 
         let uninverted_delta_y = delta_y;
 
-        let device = event.device();
-        if let Some(device) = (&device as &dyn Any).downcast_ref::<input::Device>() {
-            if device.config_scroll_natural_scroll_enabled() {
-                delta_x = -delta_x;
-                delta_y = -delta_y;
+        // 🐧 Apply natural scroll from libinput (Linux only)
+        #[cfg(target_os = "linux")]
+        {
+            let device = event.device();
+            if let Some(device) = (&device as &dyn Any).downcast_ref::<input::Device>() {
+                if device.config_scroll_natural_scroll_enabled() {
+                    delta_x = -delta_x;
+                    delta_y = -delta_y;
+                }
             }
         }
 
@@ -4689,6 +4705,8 @@ fn hardcoded_overview_bind(raw: Keysym, mods: ModifiersState) -> Option<Bind> {
     })
 }
 
+/// 🐧 Applies libinput settings to a device (Linux only)
+#[cfg(target_os = "linux")]
 pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::Device) {
     // According to Mutter code, this setting is specific to touchpads.
     let is_touchpad = device.config_tap_finger_count() > 0;

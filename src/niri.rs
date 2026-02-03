@@ -112,8 +112,17 @@ use smithay::wayland::xdg_foreign::XdgForeignState;
 #[cfg(feature = "dbus")]
 use crate::a11y::A11y;
 use crate::animation::Clock;
+use crate::backend::{Backend, Headless, RenderResult};
+
+// 🐧 Linux-specific backend imports
+#[cfg(target_os = "linux")]
 use crate::backend::tty::SurfaceDmabufFeedback;
-use crate::backend::{Backend, Headless, RenderResult, Tty, Winit};
+#[cfg(target_os = "linux")]
+use crate::backend::{Tty, Winit};
+
+// 🍎 macOS-specific backend imports
+#[cfg(target_os = "macos")]
+use crate::backend::MacOS;
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToNiri;
@@ -170,12 +179,17 @@ use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
-use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
     center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
     logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, write_png_rgba8, xwayland,
+    send_scale_transform, write_png_rgba8,
 };
+
+// 🐧 Xwayland support (Linux only)
+#[cfg(target_os = "linux")]
+use crate::utils::xwayland;
+#[cfg(target_os = "linux")]
+use crate::utils::xwayland::satellite::Satellite;
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
 
@@ -409,6 +423,8 @@ pub struct Niri {
     pub ipc_server: Option<IpcServer>,
     pub ipc_outputs_changed: bool,
 
+    // 🐧 Xwayland satellite (Linux only)
+    #[cfg(target_os = "linux")]
     pub satellite: Option<Satellite>,
 
     #[cfg(feature = "xdp-gnome-screencast")]
@@ -710,20 +726,46 @@ impl State {
 
         let config = Rc::new(RefCell::new(config));
 
-        let has_display = env::var_os("WAYLAND_DISPLAY").is_some()
-            || env::var_os("WAYLAND_SOCKET").is_some()
-            || env::var_os("DISPLAY").is_some();
+        // 🎰 Backend Selection - Choose Your Own Adventure!
+        //
+        // Linux: TTY for native, Winit for nested/testing
+        // macOS: Always use the macOS native backend
+        // All: Headless for testing without display
 
         let mut backend = if headless {
             let headless = Headless::new();
             Backend::Headless(headless)
-        } else if has_display {
-            let winit = Winit::new(config.clone(), event_loop.clone())?;
-            Backend::Winit(winit)
         } else {
-            let tty = Tty::new(config.clone(), event_loop.clone())
-                .context("error initializing the TTY backend")?;
-            Backend::Tty(tty)
+            #[cfg(target_os = "macos")]
+            {
+                // 🍎 macOS: Use our beautiful native backend
+                info!("🍎 Initializing macOS native backend...");
+                let macos = crate::backend::MacOS::new(config.clone(), event_loop.clone());
+                Backend::MacOS(macos)
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                let has_display = env::var_os("WAYLAND_DISPLAY").is_some()
+                    || env::var_os("WAYLAND_SOCKET").is_some()
+                    || env::var_os("DISPLAY").is_some();
+
+                if has_display {
+                    let winit = Winit::new(config.clone(), event_loop.clone())?;
+                    Backend::Winit(winit)
+                } else {
+                    let tty = Tty::new(config.clone(), event_loop.clone())
+                        .context("error initializing the TTY backend")?;
+                    Backend::Tty(tty)
+                }
+            }
+
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                // 🤷 Unknown platform - fall back to headless
+                warn!("Unknown platform, falling back to headless backend");
+                Backend::Headless(Headless::new())
+            }
         };
 
         let mut niri = Niri::new(
@@ -1462,6 +1504,7 @@ impl State {
         let mut shaders_changed = false;
         let mut cursor_inactivity_timeout_changed = false;
         let mut recent_windows_changed = false;
+        #[cfg(target_os = "linux")]
         let mut xwls_changed = false;
         let mut old_config = self.niri.config.borrow_mut();
 
@@ -1589,6 +1632,7 @@ impl State {
             recent_windows_changed = true;
         }
 
+        #[cfg(target_os = "linux")]
         if config.xwayland_satellite != old_config.xwayland_satellite {
             xwls_changed = true;
         }
@@ -1671,6 +1715,7 @@ impl State {
             self.niri.window_mru_ui.update_config();
         }
 
+        #[cfg(target_os = "linux")]
         if xwls_changed {
             // If xwl-s was previously working and is now off, we don't try to kill it or stop
             // watching the sockets, for simplicity's sake.
@@ -2287,10 +2332,16 @@ impl Niri {
         let viewporter_state = ViewporterState::new::<State>(&display_handle);
         let xdg_foreign_state = XdgForeignState::new::<State>(&display_handle);
 
-        let is_tty = matches!(backend, Backend::Tty(_));
+        // 🌈 Gamma control is only available on the TTY backend (Linux)
+        // On macOS, the system manages display gamma
+        #[cfg(target_os = "linux")]
+        let is_native_backend = matches!(backend, Backend::Tty(_));
+        #[cfg(not(target_os = "linux"))]
+        let is_native_backend = false;
+
         let gamma_control_manager_state =
             GammaControlManagerState::new::<State, _>(&display_handle, move |client| {
-                is_tty && !client.get_data::<ClientState>().unwrap().restricted
+                is_native_backend && !client.get_data::<ClientState>().unwrap().restricted
             });
         let activation_state = XdgActivationState::new::<State>(&display_handle);
         event_loop
@@ -2563,6 +2614,7 @@ impl Niri {
             ipc_server,
             ipc_outputs_changed: false,
 
+            #[cfg(target_os = "linux")]
             satellite: None,
 
             #[cfg(feature = "xdp-gnome-screencast")]
@@ -4608,6 +4660,11 @@ impl Niri {
         }
     }
 
+    /// 📦 Sends DMA-BUF feedback to surfaces (Linux only)
+    ///
+    /// This function is specific to Linux DRM/GBM backends where
+    /// DMA-BUF feedback helps clients optimize their buffer allocation.
+    #[cfg(target_os = "linux")]
     pub fn send_dmabuf_feedbacks(
         &self,
         output: &Output,
